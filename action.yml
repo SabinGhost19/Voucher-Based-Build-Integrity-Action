@@ -1,0 +1,253 @@
+name: "VBBI Voucher Attestor"
+description: "Generate a Voucher-Based Build Integrity predicate and attach it as a Cosign attestation"
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  image:
+    description: "Immutable image reference in digest form"
+    required: true
+  commit-sha:
+    description: "Git commit SHA associated with the build"
+    required: true
+  step-spec-path:
+    description: "Path to a JSON file containing the ordered list of VBBI steps and metadata files"
+    required: true
+  hmac-key:
+    description: "Shared HMAC key used to seal the voucher in this stage"
+    required: false
+    default: "dev-only-vbbi-key"
+  vault-address:
+    description: "Vault base URL used for Transit HMAC generation"
+    required: false
+    default: ""
+  vault-token:
+    description: "Vault token used to access Transit when vault-address is configured"
+    required: false
+    default: ""
+  vault-namespace:
+    description: "Optional Vault enterprise namespace"
+    required: false
+    default: ""
+  vault-transit-mount:
+    description: "Vault Transit mount path"
+    required: false
+    default: "transit"
+  vault-transit-key:
+    description: "Vault Transit key name used to compute the VBBI HMAC chain"
+    required: false
+    default: ""
+  vault-transit-algorithm:
+    description: "Vault Transit HMAC algorithm"
+    required: false
+    default: "sha2-256"
+  slsa-level:
+    description: "SLSA level declared in the voucher build context"
+    required: false
+    default: "3"
+  attestation-type:
+    description: "Cosign attestation type for the VBBI voucher"
+    required: false
+    default: "https://devsecops.licenta.ro/VBBI/v1"
+
+outputs:
+  merkle-root:
+    description: "Computed Merkle root for the generated VBBI voucher"
+    value: ${{ steps.build-predicate.outputs.merkle_root }}
+  predicate-path:
+    description: "Path to the generated VBBI predicate JSON file"
+    value: ${{ steps.build-predicate.outputs.predicate_path }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install Cosign
+      uses: sigstore/cosign-installer@v3.7.0
+
+    - name: Build VBBI predicate
+      id: build-predicate
+      shell: bash
+      env:
+        INPUT_IMAGE: ${{ inputs.image }}
+        INPUT_COMMIT_SHA: ${{ inputs.commit-sha }}
+        INPUT_STEP_SPEC_PATH: ${{ inputs.step-spec-path }}
+        INPUT_HMAC_KEY: ${{ inputs.hmac-key }}
+        INPUT_VAULT_ADDRESS: ${{ inputs.vault-address }}
+        INPUT_VAULT_TOKEN: ${{ inputs.vault-token }}
+        INPUT_VAULT_NAMESPACE: ${{ inputs.vault-namespace }}
+        INPUT_VAULT_TRANSIT_MOUNT: ${{ inputs.vault-transit-mount }}
+        INPUT_VAULT_TRANSIT_KEY: ${{ inputs.vault-transit-key }}
+        INPUT_VAULT_TRANSIT_ALGORITHM: ${{ inputs.vault-transit-algorithm }}
+        INPUT_SLSA_LEVEL: ${{ inputs.slsa-level }}
+      run: |
+        test -f "$INPUT_STEP_SPEC_PATH"
+        python3 - <<'PY'
+        import base64
+        import hashlib
+        import hmac
+        import json
+        import os
+        from pathlib import Path
+        from urllib import error, request
+
+        def sha256_text(value: str) -> str:
+          return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+        def local_hmac_step(secret_key: str, metadata_hash: str, previous_hash: str) -> str:
+          payload = f"{metadata_hash}{previous_hash}".encode("utf-8")
+          return hmac.new(secret_key.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+
+        def vault_hmac_step(metadata_hash: str, previous_hash: str) -> str:
+          vault_address = os.environ["INPUT_VAULT_ADDRESS"].strip()
+          vault_token = os.environ["INPUT_VAULT_TOKEN"].strip()
+          transit_mount = os.environ["INPUT_VAULT_TRANSIT_MOUNT"].strip()
+          transit_key = os.environ["INPUT_VAULT_TRANSIT_KEY"].strip()
+          transit_algorithm = os.environ["INPUT_VAULT_TRANSIT_ALGORITHM"].strip()
+          if not vault_address or not vault_token or not transit_key:
+            raise SystemExit("vault-address, vault-token and vault-transit-key are required for Vault Transit mode")
+
+          req = request.Request(
+            f"{vault_address.rstrip('/')}/v1/{transit_mount}/hmac/{transit_key}/{transit_algorithm}",
+            data=json.dumps(
+              {
+                "input": base64.b64encode(
+                  f"{metadata_hash}{previous_hash}".encode("utf-8")
+                ).decode("utf-8")
+              }
+            ).encode("utf-8"),
+            headers={
+              "Content-Type": "application/json",
+              "X-Vault-Token": vault_token,
+              **(
+                {"X-Vault-Namespace": os.environ["INPUT_VAULT_NAMESPACE"].strip()}
+                if os.environ["INPUT_VAULT_NAMESPACE"].strip()
+                else {}
+              ),
+            },
+            method="POST",
+          )
+          try:
+            with request.urlopen(req, timeout=30) as response:
+              parsed = json.loads(response.read().decode("utf-8"))
+          except error.HTTPError as exc:
+            raise SystemExit(exc.read().decode("utf-8", errors="replace")) from exc
+          except error.URLError as exc:
+            raise SystemExit(f"Vault Transit request failed: {exc}") from exc
+
+          digest = str((((parsed.get("data", {}) or {}).get("hmac", "")) or "")).strip()
+          if not digest:
+            raise SystemExit("Vault Transit response did not contain data.hmac")
+          return digest
+
+        def normalized_hash(value: str) -> str:
+          lowered = value.strip().lower()
+          if lowered.startswith("vault:v"):
+            parts = lowered.split(":", 2)
+            return parts[2] if len(parts) == 3 else lowered
+          return lowered.split(":", 1)[1] if lowered.startswith("sha256:") else lowered
+
+        def merkle_root(leaves: list[str]) -> str:
+          if not leaves:
+            raise SystemExit("step-spec must contain at least one step")
+          nodes = [sha256_text(normalized_hash(item)) for item in leaves]
+          while len(nodes) > 1:
+            next_level = []
+            for index in range(0, len(nodes), 2):
+              left = nodes[index]
+              right = nodes[index + 1] if index + 1 < len(nodes) else left
+              next_level.append(sha256_text(left + right))
+            nodes = next_level
+          return nodes[0]
+
+        step_spec_path = Path(os.environ["INPUT_STEP_SPEC_PATH"])
+        step_spec = json.loads(step_spec_path.read_text())
+        if not isinstance(step_spec, list):
+          raise SystemExit("step-spec JSON must be an array")
+        if not step_spec:
+          raise SystemExit("step-spec JSON must contain at least one step")
+
+        seed = sha256_text(os.environ["INPUT_COMMIT_SHA"])
+        previous = seed
+        steps = []
+        leaves = []
+        use_vault = bool(os.environ["INPUT_VAULT_ADDRESS"].strip())
+        seen_step_names = set()
+
+        for index, item in enumerate(step_spec, start=1):
+          step_name = str(item.get("name", "")).strip()
+          file_path = str(item.get("file", "")).strip()
+          if not step_name or not file_path:
+            raise SystemExit("each step-spec entry must contain name and file")
+          if step_name in seen_step_names:
+            raise SystemExit(f"duplicate VBBI step name: {step_name}")
+          seen_step_names.add(step_name)
+
+          metadata_path = Path(file_path)
+          if not metadata_path.exists():
+            raise SystemExit(f"missing metadata file for VBBI step: {file_path}")
+
+          metadata = (
+            json.loads(metadata_path.read_text())
+            if metadata_path.suffix == ".json"
+            else {"raw": metadata_path.read_text()}
+          )
+          metadata_hash = sha256_text(json.dumps(metadata, sort_keys=True, separators=(",", ":")))
+          current = (
+            vault_hmac_step(metadata_hash, previous)
+            if use_vault
+            else local_hmac_step(os.environ["INPUT_HMAC_KEY"], metadata_hash, previous)
+          )
+          steps.append(
+            {
+              "position": index,
+              "step_name": step_name,
+              "metadata_hash": metadata_hash,
+              "hmac_result": current,
+            }
+          )
+          leaves.append({"step": step_name, "hash": current})
+          previous = current
+
+        predicate = {
+          "build_context": {
+            "repository": os.environ.get("GITHUB_REPOSITORY", ""),
+            "workflow": os.environ.get("GITHUB_WORKFLOW", ""),
+            "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+            "event": os.environ.get("GITHUB_EVENT_NAME", ""),
+            "issuer_oidc": "https://token.actions.githubusercontent.com",
+            "slsa_level": int(os.environ["INPUT_SLSA_LEVEL"]),
+            "image": os.environ["INPUT_IMAGE"],
+            "commit_sha": os.environ["INPUT_COMMIT_SHA"],
+          },
+          "hmac_chain": {
+            "provider": "vault-transit" if use_vault else "shared-secret",
+            "algorithm": os.environ["INPUT_VAULT_TRANSIT_ALGORITHM"] if use_vault else "sha256",
+            "h0_seed": seed,
+            "steps": steps,
+            "final_voucher": previous,
+          },
+          "merkle_tree": {
+            "leaves": leaves,
+            "root_hash": merkle_root([item["hash"] for item in leaves]),
+          },
+        }
+
+        output_path = Path("/tmp/vbbi-attestation.json")
+        output_path.write_text(json.dumps(predicate, indent=2, sort_keys=True))
+
+        github_output = Path(os.environ["GITHUB_OUTPUT"])
+        with github_output.open("a", encoding="utf-8") as handle:
+          handle.write(f"predicate_path={output_path}\n")
+          handle.write(f"merkle_root={predicate['merkle_tree']['root_hash']}\n")
+        PY
+
+    - name: Attest VBBI voucher with Cosign keyless
+      shell: bash
+      env:
+        COSIGN_EXPERIMENTAL: "false"
+      run: |
+        cosign attest --yes \
+          --predicate "${{ steps.build-predicate.outputs.predicate_path }}" \
+          --type "${{ inputs.attestation-type }}" \
+          "${{ inputs.image }}"
