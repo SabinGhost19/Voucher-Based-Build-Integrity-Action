@@ -1,23 +1,23 @@
 # VBBI Voucher Attestor
 
-Custom GitHub Action pentru Voucher-Based Build Integrity.
+Custom GitHub Action for Voucher-Based Build Integrity.
 
-Actiunea construieste un voucher VBBI pe baza unei liste ordonate de pasi, aplica HMAC chaining, calculeaza radacina Merkle si ataseaza rezultatul ca atestare Cosign.
+This action builds a VBBI voucher from an ordered list of build steps, applies HMAC chaining, computes the Merkle root, and attaches the result as a Cosign attestation.
 
 ## Inputs
 
-- `image`: referinta OCI imutabila in format digest
-- `commit-sha`: commit SHA asociat build-ului
-- `step-spec-path`: fisier JSON cu pasi in ordinea corecta
-- `hmac-key`: cheia HMAC folosita in modul implicit `shared-secret`
-- `vault-address`: URL-ul Vault pentru modul `vault-transit`
-- `vault-token`: token Vault folosit de action pentru Transit
-- `vault-namespace`: namespace Vault optional
-- `vault-transit-mount`: mount path-ul Transit
-- `vault-transit-key`: cheia Transit folosita pentru lantul HMAC
-- `vault-transit-algorithm`: algoritmul HMAC Transit, implicit `sha2-256`
-- `slsa-level`: nivelul SLSA declarat in voucher
-- `attestation-type`: tipul de atestare Cosign
+- `image`: immutable OCI image reference in digest form
+- `commit-sha`: commit SHA associated with the build
+- `step-spec-path`: JSON file containing the ordered build steps
+- `hmac-key`: HMAC key used in the default `shared-secret` mode
+- `vault-address`: Vault URL used for `vault-transit` mode
+- `vault-token`: Vault token used by the action for Transit
+- `vault-namespace`: optional Vault namespace
+- `vault-transit-mount`: Transit mount path
+- `vault-transit-key`: Transit key used for the HMAC chain
+- `vault-transit-algorithm`: Transit HMAC algorithm, default is `sha2-256`
+- `slsa-level`: SLSA level declared in the voucher
+- `attestation-type`: Cosign attestation type
 
 ## Format `step-spec-path`
 
@@ -30,11 +30,11 @@ Actiunea construieste un voucher VBBI pe baza unei liste ordonate de pasi, aplic
 ]
 ```
 
-## Exemplu de folosire
+## Usage Example
 
 ```yaml
 - name: Attach VBBI attestation
-  uses: SabinGhost19/vbbi-voucher-attestor@v1
+  uses: SabinGhost19/Voucher-Based-Build-Integrity-Action@v1
   with:
     image: ghcr.io/${{ github.repository_owner }}/demo-api@${{ steps.build.outputs.digest }}
     commit-sha: ${{ github.sha }}
@@ -43,11 +43,11 @@ Actiunea construieste un voucher VBBI pe baza unei liste ordonate de pasi, aplic
     slsa-level: 3
 ```
 
-## Exemplu cu Vault Transit
+## Vault Transit Example
 
 ```yaml
 - name: Attach VBBI attestation via Vault Transit
-  uses: SabinGhost19/vbbi-voucher-attestor@v1
+  uses: SabinGhost19/Voucher-Based-Build-Integrity-Action@v1
   with:
     image: ghcr.io/${{ github.repository_owner }}/demo-api@${{ steps.build.outputs.digest }}
     commit-sha: ${{ github.sha }}
